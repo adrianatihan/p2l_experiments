@@ -286,6 +286,12 @@ def _run_abcrown(abcrown_path, yaml_path, csv_path, results_path, verbose):
             print("    α,β-CROWN stderr (last 20 lines):")
             for line in err_lines:
                 print(f"      {line}")
+        if verbose:
+            # Print last 10 lines of stdout to see what abcrown did
+            out_lines = proc.stdout.strip().split("\n")[-10:]
+            print("    α,β-CROWN stdout (last 10 lines):")
+            for line in out_lines:
+                print(f"      {line}")
         return proc.returncode == 0
 
     except Exception as e:
@@ -302,9 +308,12 @@ def _parse_results(results_path, ordered_indices, verbose):
     """
     Parse α,β-CROWN results file → dict[int → str].
 
-    The results file has one line per instance in CSV order.
-    Each line is typically: "safe", "unsafe", "unknown", or "timeout".
-    Some versions include extra columns — we take the first word.
+    The pickle format is:
+        {'results': [['safe-incomplete', time], ['unsafe-pgd', time], ...],
+         'summary': defaultdict(list, {'safe-incomplete': [...], ...}),
+         'bab_ret': [...]}
+
+    'results' has one [status, time] pair per instance in CSV order.
     """
     statuses = {}
 
@@ -315,20 +324,49 @@ def _parse_results(results_path, ordered_indices, verbose):
             statuses[gidx] = "unknown"
         return statuses
 
-    with open(results_path, "r") as f:
-        lines = [l.strip() for l in f if l.strip()]
+    try:
+        import pickle
+        with open(results_path, "rb") as f:
+            data = pickle.load(f)
+    except Exception as e:
+        if verbose:
+            print(f"    Failed to load results: {e}, marking all unknown")
+        for gidx in ordered_indices:
+            statuses[gidx] = "unknown"
+        return statuses
 
-    for i, gidx in enumerate(ordered_indices):
-        if i < len(lines):
-            # Take first word, normalise to our convention
-            token = lines[i].split(",")[-1].strip().split()[0].lower()
-            if token in ("safe", "holds", "unsat"):
-                statuses[gidx] = "verified"
-            elif token in ("unsafe", "violated", "sat"):
-                statuses[gidx] = "unsafe"
+    # ── Extract per-instance results ──────────────────────────────────
+    per_instance = None
+
+    if isinstance(data, dict) and "results" in data:
+        # Standard abcrown format: data['results'] = [[status, time], ...]
+        per_instance = data["results"]
+    elif isinstance(data, dict) and "summary" in data:
+        # Fallback: reconstruct from summary dict
+        summary = data["summary"]
+        n = len(ordered_indices)
+        per_instance = [["unknown", 0.0]] * n
+        for status_str, idx_list in summary.items():
+            for idx in idx_list:
+                if idx < n:
+                    per_instance[idx] = [status_str, 0.0]
+    elif isinstance(data, (list, tuple)):
+        per_instance = data
+
+    if per_instance is not None:
+        for i, gidx in enumerate(ordered_indices):
+            if i < len(per_instance):
+                entry = per_instance[i]
+                if isinstance(entry, (list, tuple)) and len(entry) >= 1:
+                    statuses[gidx] = _normalise_status(str(entry[0]))
+                else:
+                    statuses[gidx] = _normalise_status(str(entry))
             else:
                 statuses[gidx] = "unknown"
-        else:
+    else:
+        if verbose:
+            print(f"    Unexpected pickle structure: keys={list(data.keys()) if isinstance(data, dict) else type(data)}")
+        for gidx in ordered_indices:
             statuses[gidx] = "unknown"
 
     if verbose:
@@ -339,6 +377,17 @@ def _parse_results(results_path, ordered_indices, verbose):
               f"{nu} unsafe, {nk} unknown")
 
     return statuses
+
+
+def _normalise_status(raw):
+    """Map α,β-CROWN status strings to our convention."""
+    token = raw.strip().lower()
+    if any(s in token for s in ("safe", "holds", "unsat", "verified")):
+        return "verified"
+    elif any(s in token for s in ("unsafe", "violated", "sat", "counterexample")):
+        return "unsafe"
+    else:
+        return "unknown"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
