@@ -71,8 +71,9 @@ class BasicBlock(nn.Module):
 class CifarResNet(nn.Module):
     """
     Lightweight ResNet for CIFAR-10 binary classification.
-    conv1(3→64) → 4 layers of BasicBlocks → flatten → fc(8192→1)
+    conv1(3→64) → 4 layers of BasicBlocks → pool_conv(4×4→1×1) → fc(512→1)
     No BatchNorm, no AvgPool, no conv bias — clean for ONNX/onnx2pytorch.
+    Pool conv replaces avg_pool2d to avoid onnx2pytorch count_include_pad bug.
     """
  
     def __init__(self):
@@ -83,8 +84,9 @@ class CifarResNet(nn.Module):
         self.layer2 = self._make_layer(128, 1, stride=2)
         self.layer3 = self._make_layer(256, 1, stride=2)
         self.layer4 = self._make_layer(512, 1, stride=2)
-        # After layer4: 512 channels × 4×4 spatial = 8192
-        self.fc = nn.Linear(512 * 4 * 4, 1)
+        # Learned pooling: 512×4×4 → 512×1×1 (replaces avg_pool2d)
+        self.pool_conv = nn.Conv2d(512, 512, kernel_size=4, stride=4, bias=False)
+        self.fc = nn.Linear(512, 1)
         self._init_weights()
  
     def _make_layer(self, planes, num_blocks, stride):
@@ -112,7 +114,8 @@ class CifarResNet(nn.Module):
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.layer4(out)
-        out = torch.flatten(out, 1)
+        out = self.pool_conv(out)       # 512×4×4 → 512×1×1
+        out = torch.flatten(out, 1)     # 512
         return self.fc(out)
 
 
