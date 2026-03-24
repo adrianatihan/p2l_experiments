@@ -71,21 +71,22 @@ class BasicBlock(nn.Module):
 class CifarResNet(nn.Module):
     """
     Lightweight ResNet for CIFAR-10 binary classification.
-    conv1(3→64) → 4 layers of BasicBlocks → avg_pool → fc(512→1)
-    No BatchNorm — cleaner for bound propagation.
+    conv1(3→64) → 4 layers of BasicBlocks → flatten → fc(8192→1)
+    No BatchNorm, no AvgPool, no conv bias — clean for ONNX/onnx2pytorch.
     """
-
+ 
     def __init__(self):
         super().__init__()
         self.in_planes = 64
-        self.conv1 = nn.Conv2d(3, 64, 3, stride=1, padding=1, bias=True)
+        self.conv1 = nn.Conv2d(3, 64, 3, stride=1, padding=1, bias=False)
         self.layer1 = self._make_layer(64, 1, stride=1)
         self.layer2 = self._make_layer(128, 1, stride=2)
         self.layer3 = self._make_layer(256, 1, stride=2)
         self.layer4 = self._make_layer(512, 1, stride=2)
-        self.fc = nn.Linear(512, 1)
+        # After layer4: 512 channels × 4×4 spatial = 8192
+        self.fc = nn.Linear(512 * 4 * 4, 1)
         self._init_weights()
-
+ 
     def _make_layer(self, planes, num_blocks, stride):
         strides = [stride] + [1] * (num_blocks - 1)
         layers = []
@@ -93,17 +94,16 @@ class CifarResNet(nn.Module):
             layers.append(BasicBlock(self.in_planes, planes, s))
             self.in_planes = planes
         return nn.Sequential(*layers)
-
+ 
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=0.5)
-                nn.init.constant_(m.bias, 0)
-
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+ 
     def forward(self, x):
         if x.dim() == 2:
             x = x.view(-1, 3, 32, 32)
@@ -112,7 +112,6 @@ class CifarResNet(nn.Module):
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.layer4(out)
-        out = F.avg_pool2d(out, 4)
         out = torch.flatten(out, 1)
         return self.fc(out)
 
