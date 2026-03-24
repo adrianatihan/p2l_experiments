@@ -258,6 +258,16 @@ def _run_abcrown(abcrown_path, yaml_path, csv_path, results_path, verbose):
         "--results_file", results_path,
     ]
 
+    # auto_LiRPA lives inside the complete_verifier dir — the subprocess
+    # needs PYTHONPATH set so `from auto_LiRPA import ...` works
+    env = os.environ.copy()
+    extra_paths = [abcrown_path]
+    auto_lirpa_dir = os.path.join(abcrown_path, "auto_LiRPA")
+    if os.path.isdir(auto_lirpa_dir):
+        extra_paths.append(auto_lirpa_dir)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(extra_paths + ([existing] if existing else []))
+
     if verbose:
         print(f"    Running α,β-CROWN: {' '.join(cmd[-6:])}")
 
@@ -265,6 +275,7 @@ def _run_abcrown(abcrown_path, yaml_path, csv_path, results_path, verbose):
         proc = subprocess.run(
             cmd,
             cwd=abcrown_path,
+            env=env,
             capture_output=True,
             text=True,
             timeout=None,  # overall timeout handled per-instance by abcrown

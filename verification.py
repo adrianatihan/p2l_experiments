@@ -9,6 +9,8 @@ so the P2L loop can rank non-verified examples by certified hardness.
 """
 
 import copy
+import os
+import sys
 import torch
 import torch.nn.functional as F
 
@@ -22,6 +24,18 @@ def _ensure_autolirpa():
     global _BoundedModule, _BoundedTensor, _PerturbationLpNorm
     if _BoundedModule is not None:
         return
+
+    # auto_LiRPA ships inside the α,β-CROWN repo — find it by walking
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    abcrown_root = os.path.join(project_dir, "alpha-beta-CROWN")
+    if os.path.isdir(abcrown_root):
+        for dirpath, dirnames, filenames in os.walk(abcrown_root):
+            if "auto_LiRPA" in dirnames:
+                candidate = dirpath  # parent of auto_LiRPA/
+                if candidate not in sys.path:
+                    sys.path.insert(0, candidate)
+                break
+
     from auto_LiRPA import BoundedModule, BoundedTensor
     from auto_LiRPA.perturbations import PerturbationLpNorm
     _BoundedModule = BoundedModule

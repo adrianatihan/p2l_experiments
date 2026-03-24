@@ -48,8 +48,16 @@ EPSILON = DATASET_DEFAULTS[DATASET]["epsilon"]
 VERIFIER = "abcrown"       # "autolirpa" | "abcrown"
 
 # α,β-CROWN settings (only used when VERIFIER = "abcrown")
-ABCROWN_PATH    = os.path.join(os.path.dirname(__file__),
-                    "alpha-beta-CROWN", "complete_verifier")
+def _find_abcrown_path():
+    """Walk alpha-beta-CROWN/ to find the directory containing abcrown.py."""
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "alpha-beta-CROWN")
+    for dirpath, _, filenames in os.walk(root):
+        if "abcrown.py" in filenames:
+            return dirpath
+    return root  # fallback — will error later with a clear message
+
+ABCROWN_PATH    = _find_abcrown_path()
 ABCROWN_TIMEOUT = 120        # per-instance timeout in seconds
 
 # ── Data ──────────────────────────────────────────────────────────────────
