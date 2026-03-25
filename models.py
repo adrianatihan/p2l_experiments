@@ -170,6 +170,7 @@ class CifarCNN(nn.Module):
 MODEL_REGISTRY = {
     "mnist_mlp": (BinaryMLP, (1, 784)),
     "cifar_resnet": (CifarResNet, (1, 3, 32, 32)),
+    "cifar_cnn":     (CifarCNN,     (1, 3, 32, 32)),
 }
 
 
