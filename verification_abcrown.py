@@ -34,9 +34,12 @@ from verification import _worst_case_bce_from_bounds
 
 def verify_batch_abcrown(model, indices, X_data, y_data, epsilon,
                          input_shape, device="cuda", abcrown_path=None,
-                         timeout=120, verbose=True):
+                         timeout=120, verbose=True, chunk_size=16):
     """
     Verify examples using α,β-CROWN (complete: PGD + alpha-CROWN + BaB).
+
+    Processes examples in chunks to avoid GPU OOM — each chunk gets its
+    own ONNX export, VNN-LIB specs, and abcrown subprocess call.
 
     Parameters
     ----------
@@ -50,6 +53,7 @@ def verify_batch_abcrown(model, indices, X_data, y_data, epsilon,
     abcrown_path : str — path to alpha-beta-CROWN/complete_verifier/
     timeout      : int — per-instance timeout in seconds
     verbose      : bool
+    chunk_size   : int — examples per abcrown call (lower = less memory)
 
     Returns
     -------
@@ -65,57 +69,75 @@ def verify_batch_abcrown(model, indices, X_data, y_data, epsilon,
     if len(indices) == 0:
         return {}
 
-    work_dir = tempfile.mkdtemp(prefix="abcrown_p2l_")
+    # Split into chunks
+    chunks = [indices[i:i + chunk_size]
+              for i in range(0, len(indices), chunk_size)]
 
-    try:
-        # ── 1. Export model to ONNX ───────────────────────────────────
-        onnx_path = _export_onnx(model, input_shape, work_dir, device)
+    if verbose:
+        print(f"    Verifying {len(indices)} examples in "
+              f"{len(chunks)} chunks (≤{chunk_size}) via α,β-CROWN")
 
-        # ── 2. Write VNN-LIB specs ───────────────────────────────────
-        spec_dir = os.path.join(work_dir, "specs")
-        os.makedirs(spec_dir, exist_ok=True)
+    all_statuses = {}
 
-        idx_to_spec = {}
-        for gidx in indices:
-            spec_path = _write_vnnlib(gidx, X_data, y_data, epsilon,
-                                      input_shape, spec_dir)
-            idx_to_spec[gidx] = spec_path
+    for ci, chunk_indices in enumerate(chunks):
+        work_dir = tempfile.mkdtemp(prefix="abcrown_p2l_")
 
-        # ── 3. Write instances CSV ────────────────────────────────────
-        csv_path = os.path.join(work_dir, "instances.csv")
-        # Keep insertion order so we can map results back
-        ordered_indices = list(indices)
-        with open(csv_path, "w") as f:
-            for gidx in ordered_indices:
-                f.write(f"{onnx_path},{idx_to_spec[gidx]},{timeout}\n")
+        try:
+            # ── 1. Export model to ONNX ───────────────────────────────
+            onnx_path = _export_onnx(model, input_shape, work_dir, device)
 
-        # ── 4. Write YAML config ─────────────────────────────────────
-        yaml_path = _write_yaml_config(work_dir, device, timeout)
+            # ── 2. Write VNN-LIB specs ────────────────────────────────
+            spec_dir = os.path.join(work_dir, "specs")
+            os.makedirs(spec_dir, exist_ok=True)
 
-        # ── 5. Run α,β-CROWN ─────────────────────────────────────────
-        results_path = os.path.join(work_dir, "results.txt")
-        success = _run_abcrown(abcrown_path, yaml_path, csv_path,
-                               results_path, verbose)
+            idx_to_spec = {}
+            for gidx in chunk_indices:
+                spec_path = _write_vnnlib(gidx, X_data, y_data, epsilon,
+                                          input_shape, spec_dir)
+                idx_to_spec[gidx] = spec_path
 
-        # ── 6. Parse results ──────────────────────────────────────────
-        abcrown_statuses = _parse_results(results_path, ordered_indices,
-                                          verbose)
+            # ── 3. Write instances CSV ────────────────────────────────
+            csv_path = os.path.join(work_dir, "instances.csv")
+            ordered = list(chunk_indices)
+            with open(csv_path, "w") as f:
+                for gidx in ordered:
+                    f.write(f"{onnx_path},{idx_to_spec[gidx]},{timeout}\n")
 
-        # ── 7. Add ranking bounds for non-verified ────────────────────
-        results = _add_ranking_bounds(abcrown_statuses, model, X_data,
-                                      y_data, epsilon, input_shape, device)
+            # ── 4. Write YAML config ──────────────────────────────────
+            yaml_path = _write_yaml_config(work_dir, device, timeout)
+
+            # ── 5. Run α,β-CROWN ─────────────────────────────────────
+            results_path = os.path.join(work_dir, "results.txt")
+            _run_abcrown(abcrown_path, yaml_path, csv_path,
+                         results_path, verbose=(verbose and ci == 0))
+
+            # ── 6. Parse results ──────────────────────────────────────
+            chunk_statuses = _parse_results(results_path, ordered,
+                                            verbose=(verbose and ci == 0))
+            all_statuses.update(chunk_statuses)
+
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            torch.cuda.empty_cache()
 
         if verbose:
-            nv = sum(1 for s, _ in results.values() if s == "verified")
-            nu = sum(1 for s, _ in results.values() if s == "unsafe")
-            nk = sum(1 for s, _ in results.values() if s == "unknown")
-            print(f"        Done: {nv} verified, "
-                  f"{nu} unsafe, {nk} unknown")
+            nv = sum(1 for s in all_statuses.values() if s == "verified")
+            nu = sum(1 for s in all_statuses.values() if s == "unsafe")
+            nk = sum(1 for s in all_statuses.values() if s == "unknown")
+            print(f"        Chunk {ci+1}/{len(chunks)}: "
+                  f"{nv} verified, {nu} unsafe, {nk} unknown so far")
 
-        return results
+    # ── 7. Add ranking bounds for non-verified ────────────────────────
+    results = _add_ranking_bounds(all_statuses, model, X_data, y_data,
+                                  epsilon, input_shape, device)
 
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+    if verbose:
+        nv = sum(1 for s, _ in results.values() if s == "verified")
+        nu = sum(1 for s, _ in results.values() if s == "unsafe")
+        nk = sum(1 for s, _ in results.values() if s == "unknown")
+        print(f"        Done: {nv} verified, {nu} unsafe, {nk} unknown")
+
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -210,7 +232,7 @@ model:
   onnx_path: null
 
 solver:
-  batch_size: 2048
+  batch_size: 64
   alpha-crown:
     iteration: 100
     lr_alpha: 0.1
@@ -225,9 +247,7 @@ bab:
     method: kfsb
 
 attack:
-  pgd_order: before
-  pgd_steps: 100
-  pgd_restarts: 50
+  pgd_order: skip
 """
     with open(yaml_path, "w") as f:
         f.write(config)
@@ -395,13 +415,14 @@ def _normalise_status(raw):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _add_ranking_bounds(abcrown_statuses, model, X_data, y_data,
-                        epsilon, input_shape, device):
+                        epsilon, input_shape, device, ranking_chunk=4):
     """
     For non-verified examples, compute worst-case BCE from auto_LiRPA
     backward bounds (fast, incomplete — just for ranking, not for status).
 
     Verified examples get wc_bce = 0.0 (doesn't matter, they won't be
     selected). Non-verified examples that fail the backward pass get inf.
+    Processes in small chunks to avoid OOM.
     """
     from verification import _ensure_autolirpa, _verify_chunk
 
@@ -420,27 +441,30 @@ def _add_ranking_bounds(abcrown_statuses, model, X_data, y_data,
     if not non_verified_indices:
         return results
 
-    # Quick auto_LiRPA backward on non-verified for ranking bounds
+    # Quick auto_LiRPA backward on non-verified for ranking bounds (chunked)
     try:
         _ensure_autolirpa()
-        chunk_results = _verify_chunk(
-            model, non_verified_indices, X_data, y_data,
-            epsilon, input_shape, device,
-        )
-        if chunk_results is not None:
-            for gidx in non_verified_indices:
-                abcrown_status = abcrown_statuses[gidx]
-                # Use abcrown's status (authoritative), LiRPA's wc_bce (ranking)
-                _, wc_bce = chunk_results.get(gidx, (None, float("inf")))
-                results[gidx] = (abcrown_status, wc_bce)
-        else:
-            # OOM — fall back to inf
-            for gidx in non_verified_indices:
-                results[gidx] = (abcrown_statuses[gidx], float("inf"))
+        chunks = [non_verified_indices[i:i + ranking_chunk]
+                  for i in range(0, len(non_verified_indices), ranking_chunk)]
+
+        for chunk in chunks:
+            torch.cuda.empty_cache()
+            chunk_results = _verify_chunk(
+                model, chunk, X_data, y_data,
+                epsilon, input_shape, device,
+            )
+            if chunk_results is not None:
+                for gidx in chunk:
+                    abcrown_status = abcrown_statuses[gidx]
+                    _, wc_bce = chunk_results.get(gidx, (None, float("inf")))
+                    results[gidx] = (abcrown_status, wc_bce)
+            else:
+                for gidx in chunk:
+                    results[gidx] = (abcrown_statuses[gidx], float("inf"))
 
     except Exception:
-        # auto_LiRPA not available or failed — use inf for all non-verified
         for gidx in non_verified_indices:
-            results[gidx] = (abcrown_statuses[gidx], float("inf"))
+            if gidx not in results:
+                results[gidx] = (abcrown_statuses[gidx], float("inf"))
 
     return results
