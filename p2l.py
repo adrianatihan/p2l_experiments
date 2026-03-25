@@ -21,6 +21,7 @@ Selection ordering:
 """
 
 import torch
+import numpy as np
 
 from attacks import pgd_attack_bce
 
@@ -231,11 +232,11 @@ def _p2l_loop_autolirpa(
             input_shape=input_shape, device=device, verbose=verbose,
         )
 
-        non_verified, h, iteration = _process_verification_results(
+        non_verified, h, iteration = _process_verification_results_missclassification(
             statuses, stats, h, X_data, y_data,
             available_indices, pretrain_indices, T_indices,
             train_fn, retrain_lr, epochs, device, retrain_kwargs,
-            iteration, verbose, verifier_name="LiRPA",
+            iteration, verbose, verifier_name="LiRPA", ce_threshold=float(np.log(2.0))
         )
 
         if non_verified is None:
@@ -269,11 +270,11 @@ def _p2l_loop_abcrown(
             verbose=verbose,
         )
 
-        non_verified, h, iteration = _process_verification_results(
+        non_verified, h, iteration = _process_verification_results_missclassification(
             statuses, stats, h, X_data, y_data,
             available_indices, pretrain_indices, T_indices,
             train_fn, retrain_lr, epochs, device, retrain_kwargs,
-            iteration, verbose, verifier_name="abcrown",
+            iteration, verbose, verifier_name="abcrown", ce_threshold=float(np.log(2.0))
         )
 
         if non_verified is None:
@@ -341,7 +342,83 @@ def _process_verification_results(
 
     return non_verified, h, iteration
 
-
+def _process_verification_results_missclassification(
+    statuses, stats, h, X_data, y_data,
+    available_indices, pretrain_indices, T_indices,
+    train_fn, retrain_lr, epochs, device, retrain_kwargs,
+    iteration, verbose, verifier_name, ce_threshold,
+):
+    """
+    Shared logic for both backends after verification returns.
+ 
+    An example is "appropriate" if wc_bce ≤ ce_threshold — meaning the
+    model correctly classifies it even under worst-case perturbation.
+ 
+    If the verifier found an actual counterexample (status="unsafe"),
+    the example is inappropriate regardless of wc_bce (the bounds may
+    be loose, but the counterexample is real).
+ 
+    Returns
+    -------
+    (inappropriate_list, model, iteration) or (None, model, iteration)
+    if all examples are appropriate.
+    """
+    appropriate = []     # (gidx, wc_bce) — below threshold
+    inappropriate = []   # (gidx, status, wc_bce) — above threshold or unsafe
+    stats['appropriate'] = 0
+    stats['inappropriate'] = 0
+    for gidx, (status, wc_bce) in statuses.items():
+        # If verifier found a real counterexample, the example is
+        # inappropriate no matter what the bounds say
+        if status == "unsafe":
+            # Ensure wc_bce reflects this (bounds can be loose)
+            wc_bce = max(wc_bce, ce_threshold + 1.0)
+            inappropriate.append((gidx, status, wc_bce))
+            stats["inappropriate"] += 1
+        elif wc_bce <= ce_threshold:
+            appropriate.append((gidx, wc_bce))
+            stats["appropriate"] += 1
+        else:
+            # wc_bce > threshold: not yet appropriate (could be unknown
+            # or verified-with-loose-bounds)
+            inappropriate.append((gidx, status, wc_bce))
+            stats["inappropriate"] += 1
+ 
+    n_app = len(appropriate)
+    n_inapp = len(inappropriate)
+ 
+    if verbose:
+        worst_app = max((b for _, b in appropriate), default=0.0)
+        worst_inapp = max((b for _, _, b in inappropriate), default=0.0)
+        print(f"    → {n_app} appropriate (wc_bce ≤ {ce_threshold:.4f}), "
+              f"{n_inapp} inappropriate")
+        if n_app > 0:
+            print(f"      worst appropriate wc_bce: {worst_app:.4f}")
+        if n_inapp > 0:
+            print(f"      worst inappropriate wc_bce: {worst_inapp:.4f}")
+ 
+    if not inappropriate:
+        if verbose:
+            print(f"\n  All {len(available_indices)} examples appropriate "
+                  f"(wc_bce ≤ {ce_threshold:.4f}). Stopping.")
+        return None, h, iteration
+ 
+    # Select worst inappropriate by worst-case CE from bounds
+    inappropriate.sort(key=lambda t: t[2], reverse=True)
+    pick_global, pick_status, pick_wc_bce = inappropriate[0]
+ 
+    T_indices.append(pick_global)
+    available_indices.remove(pick_global)
+ 
+    if verbose:
+        print(f"  iter {iteration:4d} | {verifier_name} added "
+              f"idx {pick_global:5d} ({pick_status}, "
+              f"wc_bce={pick_wc_bce:.4f}) | |T|={len(T_indices)}")
+ 
+    h = _retrain(h, X_data, y_data, T_indices, pretrain_indices,
+                 train_fn, retrain_lr, epochs, device, retrain_kwargs)
+ 
+    return inappropriate, h, iteration
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _retrain(h, X_data, y_data, T_indices, pretrain_indices,
