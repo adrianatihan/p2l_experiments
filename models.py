@@ -118,6 +118,48 @@ class CifarResNet(nn.Module):
         out = torch.flatten(out, 1)     # 512
         return self.fc(out)
 
+class CifarCNN(nn.Module):
+    """
+    Plain CNN for CIFAR-10 binary classification.
+ 
+    conv(3→16,s1) → relu → conv(16→16,s2) → relu →
+    conv(16→32,s1) → relu → conv(32→32,s2) → relu →
+    flatten(32×8×8=2048) → fc(2048→128) → relu → fc(128→1)
+ 
+    No skip connections, no BN, no conv bias — clean and fast
+    for CROWN/BaB bound propagation.
+    """
+ 
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 16, 3, stride=1, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(16, 16, 3, stride=2, padding=1, bias=False)
+        self.conv3 = nn.Conv2d(16, 32, 3, stride=1, padding=1, bias=False)
+        self.conv4 = nn.Conv2d(32, 32, 3, stride=2, padding=1, bias=False)
+        self.fc1 = nn.Linear(32 * 8 * 8, 128)
+        self.fc2 = nn.Linear(128, 1)
+        self._init_weights()
+ 
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out",
+                                        nonlinearity="relu")
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.5)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+ 
+    def forward(self, x):
+        if x.dim() == 2:
+            x = x.view(-1, 3, 32, 32)
+        out = F.relu(self.conv1(x))    # 16×32×32
+        out = F.relu(self.conv2(out))  # 16×16×16
+        out = F.relu(self.conv3(out))  # 32×16×16
+        out = F.relu(self.conv4(out))  # 32×8×8
+        out = torch.flatten(out, 1)    # 2048
+        out = F.relu(self.fc1(out))    # 128
+        return self.fc2(out)           # 1
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Registry
