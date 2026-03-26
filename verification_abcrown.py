@@ -330,6 +330,61 @@ def _normalise_status(raw):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _add_ranking_bounds(abcrown_statuses, model, X_data, y_data,
+                        epsilon, input_shape, device, ranking_chunk=64):
+    """
+    Compute CE for ranking after abcrown verification.
+
+    - Unsafe/unknown examples: wc_ce = inf (they'll always be picked first)
+    - Verified (safe) examples: CE from model's clean forward pass
+      (needed to check ce_threshold stopping condition)
+
+    No auto_LiRPA needed — just a standard forward pass + cross entropy.
+    """
+    results = {}
+
+    unsat_indices = [g for g, s in abcrown_statuses.items() if s != "verified"]
+    sat_indices = [g for g, s in abcrown_statuses.items() if s == "verified"]
+
+    # Unsat examples get inf — they'll always be selected over sat
+    for gidx in unsat_indices:
+        results[gidx] = (abcrown_statuses[gidx], float("inf"))
+
+    if not sat_indices:
+        return results
+
+    # Compute clean CE for verified examples (standard forward pass)
+    model.eval()
+    with torch.no_grad():
+        for i in range(0, len(sat_indices), ranking_chunk):
+            chunk = sat_indices[i:i + ranking_chunk]
+
+            if isinstance(X_data, torch.Tensor):
+                x = X_data[chunk].float().to(device)
+                y = y_data[chunk].to(device)
+            else:
+                x = torch.FloatTensor(X_data[chunk]).to(device)
+                y = torch.LongTensor([int(y_data[g]) for g in chunk]).to(device)
+
+            if x.dim() == 2 and len(input_shape) == 4:
+                x = x.view(-1, *input_shape[1:])
+
+            logits = model(x)
+
+            if logits.shape[-1] == 1:
+                # Binary single-logit
+                ce = torch.nn.functional.binary_cross_entropy_with_logits(
+                    logits.squeeze(-1), y.float(), reduction="none")
+            else:
+                # Multi-class
+                ce = torch.nn.functional.cross_entropy(
+                    logits, y, reduction="none")
+
+            for j, gidx in enumerate(chunk):
+                results[gidx] = ("verified", ce[j].item())
+
+    return results
+
+def _add_ranking_bounds_autolirpa(abcrown_statuses, model, X_data, y_data,
                         epsilon, input_shape, device, ranking_chunk=4):
     """
     Compute worst-case CE from auto_LiRPA bounds for ranking.
