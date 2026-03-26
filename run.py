@@ -37,8 +37,8 @@ DATASET = "mnist"          # "mnist" | "cifar10"
 
 # Default model per dataset — override MODEL below if you want a custom one
 DATASET_DEFAULTS = {
-    "mnist":   {"model": "mnist_mlp",    "epsilon": 0.1},
-    "cifar10": {"model": "cifar_resnet", "epsilon": 2.0 / 255.0},
+    "mnist":   {"model": "mnist_mlp",    "epsilon": 0.5 / 255.0},
+    "cifar10": {"model": "cifar_resnet", "epsilon": 0.5 / 255.0},
 }
 
 MODEL   = DATASET_DEFAULTS[DATASET]["model"]
@@ -58,10 +58,10 @@ def _find_abcrown_path():
     return root  # fallback — will error later with a clear message
 
 ABCROWN_PATH    = _find_abcrown_path()
-ABCROWN_TIMEOUT = 120        # per-instance timeout in seconds
+ABCROWN_TIMEOUT = 30        # per-instance timeout in seconds
 
 # ── Data ──────────────────────────────────────────────────────────────────
-N_SAMPLES  = 2000
+N_SAMPLES  = 1000
 TEST_SIZE  = 0.2
 
 # ── P2L ───────────────────────────────────────────────────────────────────
@@ -87,6 +87,7 @@ TRADES_STEP_SIZE  = None      # None → epsilon / 3
 
 # ── BCE threshold for PGD phase ──────────────────────────────────────────
 BCE_THRESHOLD = 3.0
+CHUNK_SIZE = 4
 
 # ── Device ────────────────────────────────────────────────────────────────
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -161,6 +162,7 @@ def main():
         verifier=VERIFIER,
         abcrown_path=ABCROWN_PATH,
         abcrown_timeout=ABCROWN_TIMEOUT,
+        chunk_size=CHUNK_SIZE,
     )
     print(f"\n[Timing] P2L: {fmt_time(time.perf_counter() - t0)}")
 

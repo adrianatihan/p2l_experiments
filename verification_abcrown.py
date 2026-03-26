@@ -2,15 +2,17 @@
 Verification via α,β-CROWN complete verifier.
 
 Flow:
-  1. Export PyTorch model → ONNX (temp dir)
-  2. Write VNN-LIB specs per sample (L∞ input bounds + unsafe output cond.)
-  3. Write instances CSV + YAML config
-  4. Run α,β-CROWN via subprocess (includes PGD attack + BaB)
-  5. Parse results → verified / unsafe / unknown
-  6. Compute ranking bounds via quick auto_LiRPA backward for non-verified
+  1. Export PyTorch model → ONNX
+  2. Write VNN-LIB specs per sample
+  3. Run α,β-CROWN via subprocess (PGD + BaB)
+  4. Parse results → verified / unsafe / unknown
+  5. Compute ranking via worst-case CE from auto_LiRPA bounds
 
-Returns the same dict[int → (status, worst_case_bce)] as verification.py
-so the P2L loop can rank non-verified examples identically.
+Smart ranking:
+  - If any UNSAT (non-verified) examples exist → compute CE bounds only
+    for those (an unsat will be picked, sat bounds don't matter)
+  - If ALL are SAT (verified) → compute CE bounds for ALL remaining
+    (needed to check ce_threshold stopping condition)
 """
 
 import os
@@ -24,9 +26,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# ── Re-use auto_LiRPA ranking from the other backend ─────────────────────
-from verification import _worst_case_bce_from_bounds
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Public API
@@ -37,29 +36,7 @@ def verify_batch_abcrown(model, indices, X_data, y_data, epsilon,
                          timeout=120, verbose=True, chunk_size=16):
     """
     Verify examples using α,β-CROWN (complete: PGD + alpha-CROWN + BaB).
-
-    Processes examples in chunks to avoid GPU OOM — each chunk gets its
-    own ONNX export, VNN-LIB specs, and abcrown subprocess call.
-
-    Parameters
-    ----------
-    model        : nn.Module — single-logit binary classifier
-    indices      : list[int] — which rows of X_data to verify
-    X_data       : tensor or ndarray, full dataset
-    y_data       : tensor or ndarray, full labels
-    epsilon      : float — L∞ perturbation radius
-    input_shape  : tuple — e.g. (1, 3, 32, 32) or (1, 784)
-    device       : str
-    abcrown_path : str — path to alpha-beta-CROWN/complete_verifier/
-    timeout      : int — per-instance timeout in seconds
-    verbose      : bool
-    chunk_size   : int — examples per abcrown call (lower = less memory)
-
-    Returns
-    -------
-    dict[int → (str, float)]
-        global_index → (status, worst_case_bce)
-        status is 'verified' | 'unsafe' | 'unknown'
+    Processes in chunks. Returns dict[int → (status, worst_case_ce)].
     """
     if not abcrown_path:
         raise ValueError(
@@ -69,7 +46,6 @@ def verify_batch_abcrown(model, indices, X_data, y_data, epsilon,
     if len(indices) == 0:
         return {}
 
-    # Split into chunks
     chunks = [indices[i:i + chunk_size]
               for i in range(0, len(indices), chunk_size)]
 
@@ -83,35 +59,28 @@ def verify_batch_abcrown(model, indices, X_data, y_data, epsilon,
         work_dir = tempfile.mkdtemp(prefix="abcrown_p2l_")
 
         try:
-            # ── 1. Export model to ONNX ───────────────────────────────
             onnx_path = _export_onnx(model, input_shape, work_dir, device)
 
-            # ── 2. Write VNN-LIB specs ────────────────────────────────
             spec_dir = os.path.join(work_dir, "specs")
             os.makedirs(spec_dir, exist_ok=True)
 
             idx_to_spec = {}
             for gidx in chunk_indices:
-                spec_path = _write_vnnlib(gidx, X_data, y_data, epsilon,
-                                          input_shape, spec_dir)
-                idx_to_spec[gidx] = spec_path
+                idx_to_spec[gidx] = _write_vnnlib(
+                    gidx, X_data, y_data, epsilon, input_shape, spec_dir)
 
-            # ── 3. Write instances CSV ────────────────────────────────
             csv_path = os.path.join(work_dir, "instances.csv")
             ordered = list(chunk_indices)
             with open(csv_path, "w") as f:
                 for gidx in ordered:
                     f.write(f"{onnx_path},{idx_to_spec[gidx]},{timeout}\n")
 
-            # ── 4. Write YAML config ──────────────────────────────────
             yaml_path = _write_yaml_config(work_dir, device, timeout)
 
-            # ── 5. Run α,β-CROWN ─────────────────────────────────────
             results_path = os.path.join(work_dir, "results.txt")
             _run_abcrown(abcrown_path, yaml_path, csv_path,
                          results_path, verbose=(verbose and ci == 0))
 
-            # ── 6. Parse results ──────────────────────────────────────
             chunk_statuses = _parse_results(results_path, ordered,
                                             verbose=(verbose and ci == 0))
             all_statuses.update(chunk_statuses)
@@ -127,7 +96,7 @@ def verify_batch_abcrown(model, indices, X_data, y_data, epsilon,
             print(f"        Chunk {ci+1}/{len(chunks)}: "
                   f"{nv} verified, {nu} unsafe, {nk} unknown so far")
 
-    # ── 7. Add ranking bounds for non-verified ────────────────────────
+    # ── Compute ranking CE bounds ─────────────────────────────────────
     results = _add_ranking_bounds(all_statuses, model, X_data, y_data,
                                   epsilon, input_shape, device)
 
@@ -145,15 +114,12 @@ def verify_batch_abcrown(model, indices, X_data, y_data, epsilon,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _export_onnx(model, input_shape, work_dir, device):
-    """Export PyTorch model to ONNX in work_dir. Returns path."""
     onnx_path = os.path.join(work_dir, "model.onnx")
     model_cpu = copy.deepcopy(model).cpu().eval()
     dummy = torch.randn(*input_shape)
-
     torch.onnx.export(
         model_cpu, dummy, onnx_path,
-        input_names=["input"],
-        output_names=["output"],
+        input_names=["input"], output_names=["output"],
         opset_version=13,
         dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
         do_constant_folding=True,
@@ -166,14 +132,6 @@ def _export_onnx(model, input_shape, work_dir, device):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _write_vnnlib(gidx, X_data, y_data, epsilon, input_shape, spec_dir):
-    """
-    Write a VNN-LIB spec for one sample.
-
-    Input constraints: x_i ∈ [x_i − ε, x_i + ε]  (L∞ ball)
-    Output property (unsafe condition):
-        y=1 → unsafe if logit ≤ 0   →  (assert (<= Y_0 0.0))
-        y=0 → unsafe if logit ≥ 0   →  (assert (>= Y_0 0.0))
-    """
     if isinstance(X_data, torch.Tensor):
         x = X_data[gidx].cpu().numpy().flatten().astype(np.float64)
         y = int(y_data[gidx].item())
@@ -185,21 +143,17 @@ def _write_vnnlib(gidx, X_data, y_data, epsilon, input_shape, spec_dir):
     spec_path = os.path.join(spec_dir, f"prop_{gidx}.vnnlib")
 
     with open(spec_path, "w") as f:
-        # Declare input variables
         for i in range(n_inputs):
             f.write(f"(declare-const X_{i} Real)\n")
         f.write("(declare-const Y_0 Real)\n\n")
 
-        # Input bounds
         for i in range(n_inputs):
             lb = x[i] - epsilon
             ub = x[i] + epsilon
             f.write(f"(assert (>= X_{i} {lb:.12f}))\n")
             f.write(f"(assert (<= X_{i} {ub:.12f}))\n")
-
         f.write("\n")
 
-        # Output property: unsafe condition
         if y == 1:
             f.write("; y=1: unsafe if logit <= 0\n")
             f.write("(assert (<= Y_0 0.0))\n")
@@ -215,10 +169,8 @@ def _write_vnnlib(gidx, X_data, y_data, epsilon, input_shape, spec_dir):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _write_yaml_config(work_dir, device, timeout):
-    """Write a minimal α,β-CROWN YAML config. Returns path."""
     yaml_path = os.path.join(work_dir, "config.yaml")
     device_str = "cuda" if device.startswith("cuda") else "cpu"
-
     config = f"""\
 general:
   device: {device_str}
@@ -259,11 +211,6 @@ attack:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _run_abcrown(abcrown_path, yaml_path, csv_path, results_path, verbose):
-    """
-    Run α,β-CROWN via subprocess.
-    The complete_verifier reads the CSV of (model, spec, timeout) triples,
-    runs PGD + incomplete + BaB on each, and writes results.
-    """
     abcrown_script = os.path.join(abcrown_path, "abcrown.py")
     if not os.path.isfile(abcrown_script):
         raise FileNotFoundError(
@@ -278,42 +225,30 @@ def _run_abcrown(abcrown_path, yaml_path, csv_path, results_path, verbose):
         "--results_file", results_path,
     ]
 
-    # auto_LiRPA lives inside the complete_verifier dir — the subprocess
-    # needs PYTHONPATH set so `from auto_LiRPA import ...` works
     env = os.environ.copy()
     extra_paths = [abcrown_path]
     auto_lirpa_dir = os.path.join(abcrown_path, "auto_LiRPA")
     if os.path.isdir(auto_lirpa_dir):
         extra_paths.append(auto_lirpa_dir)
     existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = os.pathsep.join(extra_paths + ([existing] if existing else []))
+    env["PYTHONPATH"] = os.pathsep.join(
+        extra_paths + ([existing] if existing else []))
 
     if verbose:
         print(f"    Running α,β-CROWN: {' '.join(cmd[-6:])}")
 
     try:
         proc = subprocess.run(
-            cmd,
-            cwd=abcrown_path,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=None,  # overall timeout handled per-instance by abcrown
+            cmd, cwd=abcrown_path, env=env,
+            capture_output=True, text=True, timeout=None,
         )
         if verbose and proc.returncode != 0:
-            # Print last 20 lines of stderr for debugging
-            err_lines = proc.stderr.strip().split("\n")[-20:]
-            print("    α,β-CROWN stderr (last 20 lines):")
-            for line in err_lines:
+            for line in proc.stderr.strip().split("\n")[-20:]:
                 print(f"      {line}")
         if verbose:
-            # Print last 10 lines of stdout to see what abcrown did
-            out_lines = proc.stdout.strip().split("\n")[-10:]
-            print("    α,β-CROWN stdout (last 10 lines):")
-            for line in out_lines:
+            for line in proc.stdout.strip().split("\n")[-10:]:
                 print(f"      {line}")
         return proc.returncode == 0
-
     except Exception as e:
         if verbose:
             print(f"    α,β-CROWN failed: {e}")
@@ -325,16 +260,6 @@ def _run_abcrown(abcrown_path, yaml_path, csv_path, results_path, verbose):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _parse_results(results_path, ordered_indices, verbose):
-    """
-    Parse α,β-CROWN results file → dict[int → str].
-
-    The pickle format is:
-        {'results': [['safe-incomplete', time], ['unsafe-pgd', time], ...],
-         'summary': defaultdict(list, {'safe-incomplete': [...], ...}),
-         'bab_ret': [...]}
-
-    'results' has one [status, time] pair per instance in CSV order.
-    """
     statuses = {}
 
     if not os.path.isfile(results_path):
@@ -355,14 +280,10 @@ def _parse_results(results_path, ordered_indices, verbose):
             statuses[gidx] = "unknown"
         return statuses
 
-    # ── Extract per-instance results ──────────────────────────────────
     per_instance = None
-
     if isinstance(data, dict) and "results" in data:
-        # Standard abcrown format: data['results'] = [[status, time], ...]
         per_instance = data["results"]
     elif isinstance(data, dict) and "summary" in data:
-        # Fallback: reconstruct from summary dict
         summary = data["summary"]
         n = len(ordered_indices)
         per_instance = [["unknown", 0.0]] * n
@@ -377,15 +298,11 @@ def _parse_results(results_path, ordered_indices, verbose):
         for i, gidx in enumerate(ordered_indices):
             if i < len(per_instance):
                 entry = per_instance[i]
-                if isinstance(entry, (list, tuple)) and len(entry) >= 1:
-                    statuses[gidx] = _normalise_status(str(entry[0]))
-                else:
-                    statuses[gidx] = _normalise_status(str(entry))
+                raw = str(entry[0]) if isinstance(entry, (list, tuple)) else str(entry)
+                statuses[gidx] = _normalise_status(raw)
             else:
                 statuses[gidx] = "unknown"
     else:
-        if verbose:
-            print(f"    Unexpected pickle structure: keys={list(data.keys()) if isinstance(data, dict) else type(data)}")
         for gidx in ordered_indices:
             statuses[gidx] = "unknown"
 
@@ -400,52 +317,61 @@ def _parse_results(results_path, ordered_indices, verbose):
 
 
 def _normalise_status(raw):
-    """Map α,β-CROWN status strings to our convention."""
     token = raw.strip().lower()
     if any(s in token for s in ("safe", "holds", "unsat", "verified")):
         return "verified"
     elif any(s in token for s in ("unsafe", "violated", "sat", "counterexample")):
         return "unsafe"
-    else:
-        return "unknown"
+    return "unknown"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Ranking bounds via quick auto_LiRPA backward
+#  Ranking bounds via auto_LiRPA backward
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _add_ranking_bounds(abcrown_statuses, model, X_data, y_data,
                         epsilon, input_shape, device, ranking_chunk=4):
     """
-    For non-verified examples, compute worst-case BCE from auto_LiRPA
-    backward bounds (fast, incomplete — just for ranking, not for status).
+    Compute worst-case CE from auto_LiRPA bounds for ranking.
 
-    Verified examples get wc_bce = 0.0 (doesn't matter, they won't be
-    selected). Non-verified examples that fail the backward pass get inf.
-    Processes in small chunks to avoid OOM.
+    Smart strategy:
+      - If any UNSAT (unsafe/unknown) examples exist → compute CE only
+        for those. An unsat example will always be picked over a sat one,
+        so sat CE doesn't matter for selection.
+      - If ALL are SAT (verified) → compute CE for ALL remaining.
+        The P2L loop needs wc_ce for every example to check whether
+        ce_threshold is satisfied (the stopping condition).
+
+    abcrown's status (verified/unsafe/unknown) is preserved.
+    Only the wc_ce ranking comes from auto_LiRPA bounds.
     """
     from verification import _ensure_autolirpa, _verify_chunk
 
     results = {}
+    all_indices = list(abcrown_statuses.keys())
 
-    non_verified_indices = [
-        gidx for gidx, status in abcrown_statuses.items()
-        if status != "verified"
-    ]
+    unsat_indices = [g for g, s in abcrown_statuses.items()
+                     if s != "verified"]
+    sat_indices = [g for g, s in abcrown_statuses.items()
+                   if s == "verified"]
 
-    # For verified: status from abcrown, wc_bce = 0 (won't be selected)
-    for gidx, status in abcrown_statuses.items():
-        if status == "verified":
+    if unsat_indices:
+        # Unsat exist → only compute bounds for unsat (they'll be picked)
+        # Sat examples get wc_ce = 0 (won't be selected)
+        for gidx in sat_indices:
             results[gidx] = ("verified", 0.0)
+        indices_to_bound = unsat_indices
+    else:
+        # All verified → compute bounds for ALL (check ce_threshold)
+        indices_to_bound = all_indices
 
-    if not non_verified_indices:
+    if not indices_to_bound:
         return results
 
-    # Quick auto_LiRPA backward on non-verified for ranking bounds (chunked)
     try:
         _ensure_autolirpa()
-        chunks = [non_verified_indices[i:i + ranking_chunk]
-                  for i in range(0, len(non_verified_indices), ranking_chunk)]
+        chunks = [indices_to_bound[i:i + ranking_chunk]
+                  for i in range(0, len(indices_to_bound), ranking_chunk)]
 
         for chunk in chunks:
             torch.cuda.empty_cache()
@@ -455,15 +381,24 @@ def _add_ranking_bounds(abcrown_statuses, model, X_data, y_data,
             )
             if chunk_results is not None:
                 for gidx in chunk:
-                    abcrown_status = abcrown_statuses[gidx]
-                    _, wc_bce = chunk_results.get(gidx, (None, float("inf")))
-                    results[gidx] = (abcrown_status, wc_bce)
+                    _, wc_ce = chunk_results.get(gidx, (None, float("inf")))
+                    results[gidx] = (abcrown_statuses[gidx], wc_ce)
             else:
+                # OOM — single-sample fallback
                 for gidx in chunk:
-                    results[gidx] = (abcrown_statuses[gidx], float("inf"))
+                    torch.cuda.empty_cache()
+                    single = _verify_chunk(
+                        model, [gidx], X_data, y_data,
+                        epsilon, input_shape, device,
+                    )
+                    if single is not None:
+                        _, wc_ce = single.get(gidx, (None, float("inf")))
+                        results[gidx] = (abcrown_statuses[gidx], wc_ce)
+                    else:
+                        results[gidx] = (abcrown_statuses[gidx], float("inf"))
 
     except Exception:
-        for gidx in non_verified_indices:
+        for gidx in indices_to_bound:
             if gidx not in results:
                 results[gidx] = (abcrown_statuses[gidx], float("inf"))
 

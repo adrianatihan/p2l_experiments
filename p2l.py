@@ -2,28 +2,29 @@
 Pick-to-Learn core algorithm — dataset and model agnostic.
 
 Two verifier backends:
+  verifier="autolirpa":  PGD inner loop → auto_LiRPA backward (incomplete)
+  verifier="abcrown":    α,β-CROWN complete verifier (PGD + BaB built-in)
 
-  verifier="autolirpa" (default):
-      PGD inner loop exhausts attackable examples, then auto_LiRPA backward
-      (incomplete) verifies the rest. Fast but may leave many unknowns.
-
-  verifier="abcrown":
-      No separate PGD — α,β-CROWN runs its own PGD + alpha-CROWN + BaB
-      (complete verification) on every remaining example each round.
-      Slower per round but gives definitive verified/unsafe verdicts.
-
-Both: stop only when ALL remaining examples are verified.
-      Unknown = not verified (conservative).
+Stopping condition:
+    Stop when ALL remaining examples have worst_case_ce ≤ ce_threshold.
+    This ensures every example is both correctly classified AND robust.
 
 Selection ordering:
-    worst_case_logit(h, z) = lb if y=1, ub if y=0
-    Pick the non-verified example with highest BCE(worst_case_logit, y).
+    worst_case_logits(h, z)[c] = lb[c] if c == y_true, ub[c] if c != y_true
+    Total order: CE(worst_case_logits, y_true) descending.
+    The example with highest worst-case CE is selected into T first.
+
+Per-iteration reporting:
+    Each iteration prints how many examples remain inappropriate
+    (wc_ce > ce_threshold or verified-unsafe).
 """
 
-import torch
 import numpy as np
+import torch
 
 from attacks import pgd_attack_bce
+
+LOG2 = float(np.log(2.0))
 
 
 def pick_to_learn(
@@ -43,32 +44,31 @@ def pick_to_learn(
     pgd_steps=20,
     pgd_restarts=5,
     bce_threshold=3.0,
+    ce_threshold=None,
     pretrain_epochs=100,
     pretrain_kwargs=None,
     retrain_kwargs=None,
     verifier="autolirpa",
     abcrown_path=None,
     abcrown_timeout=120,
+    chunk_size = 16,
 ):
     """
     Pick-to-Learn with pluggable verification backend.
 
     Parameters
     ----------
-    verifier       : "autolirpa" | "abcrown"
-    abcrown_path   : str — path to alpha-beta-CROWN/complete_verifier/
-                     (required when verifier="abcrown")
-    abcrown_timeout : int — per-instance timeout for α,β-CROWN
-    bce_threshold  : float — PGD phase only (autolirpa mode)
-    pgd_steps, pgd_restarts : PGD config (autolirpa mode only)
-
-    Returns
-    -------
-    model, T_indices, stats
+    ce_threshold   : float — worst-case CE must be ≤ this for ALL remaining
+                     examples to stop. Default log(2) (decision boundary).
+    bce_threshold  : float — PGD phase: empirical worst-case BCE above this
+                     triggers adding to T (autolirpa mode only)
     """
     if device == "cuda" and not torch.cuda.is_available():
         print("CUDA not available, falling back to CPU")
         device = "cpu"
+
+    if ce_threshold is None:
+        ce_threshold = LOG2
 
     pretrain_kwargs = pretrain_kwargs or {}
     retrain_kwargs = retrain_kwargs or {}
@@ -78,7 +78,6 @@ def pick_to_learn(
 
     n_samples = len(X_data)
     n_pretrain = int(n_samples * pretrain_portion)
-
     pretrain_indices = list(range(n_pretrain))
     available_indices = list(range(n_pretrain, n_samples))
     N_effective = n_samples - n_pretrain
@@ -91,40 +90,30 @@ def pick_to_learn(
               + (f"  GPU: {torch.cuda.get_device_name()}"
                  if device == "cuda" else ""))
         print(f"  Samples: {n_samples}  Pretrain: {n_pretrain}  "
-              f"P2L pool: {len(available_indices)}")
+              f"P2L pool: {N_effective}")
         print(f"  ε={epsilon:.6f}  Input shape: {input_shape}")
+        print(f"  CE threshold: {ce_threshold:.4f}  (log2={LOG2:.4f})")
         if verifier == "autolirpa":
             print(f"  PGD {pgd_steps}×{pgd_restarts}  "
-                  f"threshold={bce_threshold}")
+                  f"PGD threshold={bce_threshold}")
         else:
             print(f"  abcrown timeout: {abcrown_timeout}s/instance")
 
     # ── Step 1: Pretrain ──────────────────────────────────────────────────
     h = model_fn().to(device)
-
     if n_pretrain > 0:
         if verbose:
             print("\nStep 1: Pretraining...")
         h = pretrain_fn(
-            h,
-            X_data[pretrain_indices],
-            y_data[pretrain_indices],
-            epochs=pretrain_epochs,
-            lr=lr,
-            device=device,
-            verbose=verbose,
-            **pretrain_kwargs,
+            h, X_data[pretrain_indices], y_data[pretrain_indices],
+            epochs=pretrain_epochs, lr=lr, device=device,
+            verbose=verbose, **pretrain_kwargs,
         )
 
     # ── Step 2: P2L loop ─────────────────────────────────────────────────
     T_indices = []
     iteration = 0
-    stats = {
-        "pgd_resolved": 0,
-        "verified": 0,
-        "falsified": 0,
-        "unknown": 0,
-    }
+    stats = {"pgd_resolved": 0, "appropriate": 0, "inappropriate": 0}
 
     if verbose:
         print(f"\nStep 2: P2L loop\n")
@@ -138,6 +127,7 @@ def pick_to_learn(
             device=device, verbose=verbose, epsilon=epsilon,
             retrain_kwargs=retrain_kwargs,
             abcrown_path=abcrown_path, abcrown_timeout=abcrown_timeout,
+            ce_threshold=ce_threshold, chunk_size=chunk_size,
         )
     else:
         _p2l_loop_autolirpa(
@@ -148,6 +138,7 @@ def pick_to_learn(
             device=device, verbose=verbose, epsilon=epsilon,
             pgd_steps=pgd_steps, pgd_restarts=pgd_restarts,
             bce_threshold=bce_threshold, retrain_kwargs=retrain_kwargs,
+            ce_threshold=ce_threshold,
         )
 
     if verbose:
@@ -167,7 +158,7 @@ def _p2l_loop_autolirpa(
     T_indices, stats, iteration, *,
     input_shape, train_fn, retrain_lr, epochs,
     device, verbose, epsilon, pgd_steps, pgd_restarts,
-    bce_threshold, retrain_kwargs,
+    bce_threshold, retrain_kwargs, ce_threshold,
 ):
     from verification import verify_batch
 
@@ -232,19 +223,20 @@ def _p2l_loop_autolirpa(
             input_shape=input_shape, device=device, verbose=verbose,
         )
 
-        non_verified, h, iteration = _process_verification_results_missclassification(
+        inappropriate, h, iteration = _process_results(
             statuses, stats, h, X_data, y_data,
             available_indices, pretrain_indices, T_indices,
             train_fn, retrain_lr, epochs, device, retrain_kwargs,
-            iteration, verbose, verifier_name="LiRPA", ce_threshold=float(np.log(2.0))
+            iteration, verbose, verifier_name="LiRPA",
+            ce_threshold=ce_threshold,
         )
 
-        if non_verified is None:
-            break  # all verified
+        if inappropriate is None:
+            break
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  α,β-CROWN flow: no PGD — abcrown handles attack + BaB
+#  α,β-CROWN flow
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _p2l_loop_abcrown(
@@ -252,7 +244,7 @@ def _p2l_loop_abcrown(
     T_indices, stats, iteration, *,
     model_fn, input_shape, train_fn, retrain_lr, epochs,
     device, verbose, epsilon, retrain_kwargs,
-    abcrown_path, abcrown_timeout,
+    abcrown_path, abcrown_timeout, ce_threshold, chunk_size,
 ):
     from verification_abcrown import verify_batch_abcrown
 
@@ -270,168 +262,112 @@ def _p2l_loop_abcrown(
             verbose=verbose,
         )
 
-        non_verified, h, iteration = _process_verification_results_missclassification(
+        inappropriate, h, iteration = _process_results(
             statuses, stats, h, X_data, y_data,
             available_indices, pretrain_indices, T_indices,
             train_fn, retrain_lr, epochs, device, retrain_kwargs,
-            iteration, verbose, verifier_name="abcrown", ce_threshold=float(np.log(2.0))
+            iteration, verbose, verifier_name="abcrown",
+            ce_threshold=ce_threshold,
         )
 
-        if non_verified is None:
-            break  # all verified
+        if inappropriate is None:
+            break
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Shared: process verification results, pick worst, retrain
+#  Shared: process results, report counts, pick worst, retrain
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _process_verification_results(
-    statuses, stats, h, X_data, y_data,
-    available_indices, pretrain_indices, T_indices,
-    train_fn, retrain_lr, epochs, device, retrain_kwargs,
-    iteration, verbose, verifier_name,
-):
-    """
-    Shared logic for both backends after verification returns.
-
-    Returns
-    -------
-    (non_verified_list, model, iteration) or (None, model, iteration) if all
-    verified.
-    """
-    non_verified = []
-    n_ver = 0
-    for gidx, (status, wc_bce) in statuses.items():
-        if status == "verified":
-            stats["verified"] += 1
-            n_ver += 1
-        else:
-            if status == "unsafe":
-                stats["falsified"] += 1
-            else:
-                stats["unknown"] += 1
-            non_verified.append((gidx, status, wc_bce))
-
-    n_not = len(non_verified)
-    if verbose:
-        nu = sum(1 for _, s, _ in non_verified if s == "unsafe")
-        nk = n_not - nu
-        print(f"    → {n_ver} verified, {nu} unsafe, {nk} unknown "
-              f"({n_not} not verified)")
-
-    if not non_verified:
-        if verbose:
-            print(f"\n  All {len(available_indices)} examples certified. "
-                  f"Stopping.")
-        return None, h, iteration
-
-    # Select worst non-verified by worst-case CE from bounds
-    non_verified.sort(key=lambda t: t[2], reverse=True)
-    pick_global, pick_status, pick_wc_bce = non_verified[0]
-
-    T_indices.append(pick_global)
-    available_indices.remove(pick_global)
-
-    if verbose:
-        print(f"  iter {iteration:4d} | {verifier_name} added "
-              f"idx {pick_global:5d} ({pick_status}, "
-              f"wc_bce={pick_wc_bce:.4f}) | |T|={len(T_indices)}")
-
-    h = _retrain(h, X_data, y_data, T_indices, pretrain_indices,
-                 train_fn, retrain_lr, epochs, device, retrain_kwargs)
-
-    return non_verified, h, iteration
-
-def _process_verification_results_missclassification(
+def _process_results(
     statuses, stats, h, X_data, y_data,
     available_indices, pretrain_indices, T_indices,
     train_fn, retrain_lr, epochs, device, retrain_kwargs,
     iteration, verbose, verifier_name, ce_threshold,
 ):
     """
-    Shared logic for both backends after verification returns.
- 
-    An example is "appropriate" if wc_bce ≤ ce_threshold — meaning the
-    model correctly classifies it even under worst-case perturbation.
- 
-    If the verifier found an actual counterexample (status="unsafe"),
-    the example is inappropriate regardless of wc_bce (the bounds may
-    be loose, but the counterexample is real).
- 
+    Process verification results using worst-case CE threshold.
+
+    An example is "appropriate" if:
+      - status != "unsafe"  (no real counterexample found)
+      - wc_ce ≤ ce_threshold  (correctly classified under worst-case perturbation)
+
+    An example is "inappropriate" if:
+      - status == "unsafe"  (counterexample found — always inappropriate)
+      - wc_ce > ce_threshold  (misclassified or insufficiently robust at worst case)
+
     Returns
     -------
-    (inappropriate_list, model, iteration) or (None, model, iteration)
-    if all examples are appropriate.
+    (inappropriate_list, model, iteration) — or (None, model, iteration) if
+    all examples are appropriate.
     """
-    appropriate = []     # (gidx, wc_bce) — below threshold
-    inappropriate = []   # (gidx, status, wc_bce) — above threshold or unsafe
-    stats['appropriate'] = 0
-    stats['inappropriate'] = 0
-    for gidx, (status, wc_bce) in statuses.items():
-        # If verifier found a real counterexample, the example is
-        # inappropriate no matter what the bounds say
+    appropriate = []     # (gidx, wc_ce)
+    inappropriate = []   # (gidx, status, wc_ce)
+
+    for gidx, (status, wc_ce) in statuses.items():
         if status == "unsafe":
-            # Ensure wc_bce reflects this (bounds can be loose)
-            wc_bce = max(wc_bce, ce_threshold + 1.0)
-            inappropriate.append((gidx, status, wc_bce))
-            stats["inappropriate"] += 1
-        elif wc_bce <= ce_threshold:
-            appropriate.append((gidx, wc_bce))
-            stats["appropriate"] += 1
+            # Real counterexample — always inappropriate
+            wc_ce = max(wc_ce, ce_threshold + 1.0)
+            inappropriate.append((gidx, status, wc_ce))
+        elif wc_ce <= ce_threshold:
+            appropriate.append((gidx, wc_ce))
         else:
-            # wc_bce > threshold: not yet appropriate (could be unknown
-            # or verified-with-loose-bounds)
-            inappropriate.append((gidx, status, wc_bce))
-            stats["inappropriate"] += 1
- 
+            inappropriate.append((gidx, status, wc_ce))
+
     n_app = len(appropriate)
     n_inapp = len(inappropriate)
- 
+    n_remaining = len(available_indices)
+
+    # Update running stats
+    stats["appropriate"] = stats.get("appropriate", 0) + n_app
+    stats["inappropriate"] = stats.get("inappropriate", 0) + n_inapp
+
     if verbose:
-        worst_app = max((b for _, b in appropriate), default=0.0)
-        worst_inapp = max((b for _, _, b in inappropriate), default=0.0)
-        print(f"    → {n_app} appropriate (wc_bce ≤ {ce_threshold:.4f}), "
-              f"{n_inapp} inappropriate")
+        n_unsafe = sum(1 for _, s, _ in inappropriate if s == "unsafe")
+        n_ce_fail = n_inapp - n_unsafe
+        worst_app = max((ce for _, ce in appropriate), default=0.0)
+        worst_inapp = max((ce for _, _, ce in inappropriate), default=0.0)
+
+        print(f"    ── Iteration {iteration} summary ──")
+        print(f"    Remaining: {n_remaining}  |  "
+              f"Appropriate: {n_app}  |  "
+              f"Inappropriate: {n_inapp} "
+              f"(unsafe={n_unsafe}, wc_ce>{ce_threshold:.4f}={n_ce_fail})")
         if n_app > 0:
-            print(f"      worst appropriate wc_bce: {worst_app:.4f}")
+            print(f"    Worst appropriate wc_ce: {worst_app:.4f}")
         if n_inapp > 0:
-            print(f"      worst inappropriate wc_bce: {worst_inapp:.4f}")
- 
+            print(f"    Worst inappropriate wc_ce: {worst_inapp:.4f}")
+
     if not inappropriate:
         if verbose:
-            print(f"\n  All {len(available_indices)} examples appropriate "
-                  f"(wc_bce ≤ {ce_threshold:.4f}). Stopping.")
+            print(f"\n  ✓ All {n_remaining} examples appropriate "
+                  f"(wc_ce ≤ {ce_threshold:.4f}). Stopping.")
         return None, h, iteration
- 
-    # Select worst inappropriate by worst-case CE from bounds
+
+    # Select worst inappropriate by worst-case CE
     inappropriate.sort(key=lambda t: t[2], reverse=True)
-    pick_global, pick_status, pick_wc_bce = inappropriate[0]
- 
+    pick_global, pick_status, pick_wc_ce = inappropriate[0]
+
     T_indices.append(pick_global)
     available_indices.remove(pick_global)
- 
+
     if verbose:
         print(f"  iter {iteration:4d} | {verifier_name} added "
               f"idx {pick_global:5d} ({pick_status}, "
-              f"wc_bce={pick_wc_bce:.4f}) | |T|={len(T_indices)}")
- 
+              f"wc_ce={pick_wc_ce:.4f}) | |T|={len(T_indices)}")
+
     h = _retrain(h, X_data, y_data, T_indices, pretrain_indices,
                  train_fn, retrain_lr, epochs, device, retrain_kwargs)
- 
+
     return inappropriate, h, iteration
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _retrain(h, X_data, y_data, T_indices, pretrain_indices,
              train_fn, lr, epochs, device, extra_kwargs):
-    """Retrain the model on T ∪ pretrain data."""
     combined = T_indices + pretrain_indices
     return train_fn(
-        h,
-        X_data[combined],
-        y_data[combined],
-        epochs=epochs,
-        lr=lr,
-        device=device,
-        verbose=False,
-        **extra_kwargs,
+        h, X_data[combined], y_data[combined],
+        epochs=epochs, lr=lr, device=device,
+        verbose=False, **extra_kwargs,
     )
