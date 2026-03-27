@@ -285,80 +285,77 @@ def _process_results(
     iteration, verbose, verifier_name, ce_threshold,
 ):
     """
-    Process verification results using worst-case CE threshold.
-
-    An example is "appropriate" if:
-      - status != "unsafe"  (no real counterexample found)
-      - wc_ce ≤ ce_threshold  (correctly classified under worst-case perturbation)
-
-    An example is "inappropriate" if:
-      - status == "unsafe"  (counterexample found — always inappropriate)
-      - wc_ce > ce_threshold  (misclassified or insufficiently robust at worst case)
-
-    Returns
-    -------
-    (inappropriate_list, model, iteration) — or (None, model, iteration) if
-    all examples are appropriate.
+    After verification, split into verified (safe) and unverified.
+    CE is only meaningful for verified examples (clean forward-pass CE).
+ 
+    If worst CE among verified ≤ ce_threshold:
+        → bulk-add all unverified to T, stop.
+    Otherwise:
+        → pick worst example overall, add to T, retrain, continue.
     """
-    appropriate = []     # (gidx, wc_ce)
-    inappropriate = []   # (gidx, status, wc_ce)
-
+    verified = []    # (gidx, wc_ce)
+    unverified = []  # (gidx, status, wc_ce)
+ 
     for gidx, (status, wc_ce) in statuses.items():
-        if status == "unsafe":
-            # Real counterexample — always inappropriate
-            wc_ce = max(wc_ce, ce_threshold + 1.0)
-            inappropriate.append((gidx, status, wc_ce))
-        elif wc_ce <= ce_threshold:
-            appropriate.append((gidx, wc_ce))
+        if status == "verified":
+            verified.append((gidx, wc_ce))
         else:
-            inappropriate.append((gidx, status, wc_ce))
-
-    n_app = len(appropriate)
-    n_inapp = len(inappropriate)
-    n_remaining = len(available_indices)
-
-    # Update running stats
-    stats["appropriate"] = stats.get("appropriate", 0) + n_app
-    stats["inappropriate"] = stats.get("inappropriate", 0) + n_inapp
-
+            unverified.append((gidx, status, wc_ce))
+ 
+    worst_verified_ce = max((ce for _, ce in verified), default=0.0)
+ 
     if verbose:
-        n_unsafe = sum(1 for _, s, _ in inappropriate if s == "unsafe")
-        n_ce_fail = n_inapp - n_unsafe
-        worst_app = max((ce for _, ce in appropriate), default=0.0)
-        worst_inapp = max((ce for _, _, ce in inappropriate), default=0.0)
-
+        n_unsafe = sum(1 for _, s, _ in unverified if s == "unsafe")
+        n_unknown = len(unverified) - n_unsafe
         print(f"    ── Iteration {iteration} summary ──")
-        print(f"    Remaining: {n_remaining}  |  "
-              f"Appropriate: {n_app}  |  "
-              f"Inappropriate: {n_inapp} "
-              f"(unsafe={n_unsafe}, wc_ce>{ce_threshold:.4f}={n_ce_fail})")
-        if n_app > 0:
-            print(f"    Worst appropriate wc_ce: {worst_app:.4f}")
-        if n_inapp > 0:
-            print(f"    Worst inappropriate wc_ce: {worst_inapp:.4f}")
-
-    if not inappropriate:
-        if verbose:
-            print(f"\n  ✓ All {n_remaining} examples appropriate "
-                  f"(wc_ce ≤ {ce_threshold:.4f}). Stopping.")
+        print(f"    Remaining: {len(available_indices)}")
+        print(f"    Verified: {len(verified)}  "
+              f"worst CE: {worst_verified_ce:.4f}")
+        print(f"    Unverified: {len(unverified)} "
+              f"(unsafe={n_unsafe}, unknown/timeout={n_unknown})")
+ 
+    # ── Stop if all verified examples have CE ≤ threshold ─────────────
+    if worst_verified_ce <= ce_threshold:
+        if unverified:
+            for gidx, status, wc_ce in unverified:
+                T_indices.append(gidx)
+                available_indices.remove(gidx)
+            stats["inappropriate"] = stats.get("inappropriate", 0) + len(unverified)
+ 
+            if verbose:
+                print(f"\n  ✓ Worst verified CE ({worst_verified_ce:.4f}) "
+                      f"≤ {ce_threshold:.4f}. Stopping.")
+                print(f"    Bulk-added {len(unverified)} unverified to T "
+                      f"(|T| = {len(T_indices)})")
+        else:
+            if verbose:
+                print(f"\n  ✓ All {len(available_indices)} verified, "
+                      f"worst CE {worst_verified_ce:.4f} "
+                      f"≤ {ce_threshold:.4f}. Nothing added.")
+ 
+        stats["appropriate"] = stats.get("appropriate", 0) + len(verified)
         return None, h, iteration
-
-    # Select worst inappropriate by worst-case CE
-    inappropriate.sort(key=lambda t: t[2], reverse=True)
-    pick_global, pick_status, pick_wc_ce = inappropriate[0]
-
+ 
+    # ── Not done: pick worst overall, add to T, retrain ───────────────
+    all_candidates = [(g, "verified", ce) for g, ce in verified]
+    all_candidates += [(g, s, ce) for g, s, ce in unverified]
+    all_candidates.sort(key=lambda t: t[2], reverse=True)
+ 
+    pick_global, pick_status, pick_ce = all_candidates[0]
     T_indices.append(pick_global)
     available_indices.remove(pick_global)
-
+    stats["inappropriate"] = stats.get("inappropriate", 0) + 1
+ 
     if verbose:
         print(f"  iter {iteration:4d} | {verifier_name} added "
               f"idx {pick_global:5d} ({pick_status}, "
-              f"wc_ce={pick_wc_ce:.4f}) | |T|={len(T_indices)}")
-
+              f"ce={pick_ce:.4f}) | |T|={len(T_indices)}")
+ 
     h = _retrain(h, X_data, y_data, T_indices, pretrain_indices,
                  train_fn, retrain_lr, epochs, device, retrain_kwargs)
+ 
+    return all_candidates, h, iteration
 
-    return inappropriate, h, iteration
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
