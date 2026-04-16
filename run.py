@@ -18,9 +18,9 @@ from sklearn.model_selection import train_test_split
 
 from data import load_dataset
 from models import get_model_fn
-from training import train_model_bce, train_model_trades, pretrain_model_bce
+from training import train_model_ce, train_model_trades, pretrain_model_ce
 from bounds import compute_generalization_bound
-from utils import evaluate_model_binary, fmt_time
+from utils import evaluate_model, fmt_time
 from p2l import pick_to_learn
 
 warnings.filterwarnings("ignore")
@@ -33,7 +33,7 @@ torch.manual_seed(11)
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
 # ── Dataset (just change this one line to switch tasks) ──────────────────
-DATASET = "mnist"          # "mnist" | "cifar10"
+DATASET = "cifar10"          # "mnist" | "cifar10"
 
 # Default model per dataset — override MODEL below if you want a custom one
 DATASET_DEFAULTS = {
@@ -45,7 +45,7 @@ MODEL   = DATASET_DEFAULTS[DATASET]["model"]
 EPSILON = DATASET_DEFAULTS[DATASET]["epsilon"]
 
 # ── Verifier backend ─────────────────────────────────────────────────────
-VERIFIER = "abcrown"       # "autolirpa" | "abcrown"
+VERIFIER = "autolirpa"       # "autolirpa" | "abcrown"
 
 # α,β-CROWN settings (only used when VERIFIER = "abcrown")
 def _find_abcrown_path():
@@ -61,7 +61,7 @@ ABCROWN_PATH    = _find_abcrown_path()
 ABCROWN_TIMEOUT = 30        # per-instance timeout in seconds
 
 # ── Data ──────────────────────────────────────────────────────────────────
-N_SAMPLES  = 1000
+N_SAMPLES  = 100
 TEST_SIZE  = 0.2
 
 # ── P2L ───────────────────────────────────────────────────────────────────
@@ -118,7 +118,7 @@ def main():
             trades_step_size=TRADES_STEP_SIZE,
         )
     else:
-        retrain_fn = train_model_bce
+        retrain_fn = train_model_ce
         retrain_kwargs = {}
 
     # ── Print config ──────────────────────────────────────────────────────
@@ -146,7 +146,7 @@ def main():
         model_fn=model_fn,
         input_shape=input_shape,
         train_fn=retrain_fn,
-        pretrain_fn=pretrain_model_bce,
+        pretrain_fn=pretrain_model_ce,
         pretrain_portion=PRETRAIN_PORTION,
         epochs=RETRAIN_EPOCHS,
         lr=PRETRAIN_LR,
@@ -171,7 +171,7 @@ def main():
     bound = compute_generalization_bound(len(T_indices), N_eff, DELTA)
 
     # ── Test evaluation ───────────────────────────────────────────────────
-    test_err, test_acc = evaluate_model_binary(h, X_test, y_test, DEVICE)
+    test_err, test_acc = evaluate_model(h, X_test, y_test, DEVICE)
 
     # ── Robust verification on test set (same backend as training) ────────
     test_indices = list(range(len(X_test)))

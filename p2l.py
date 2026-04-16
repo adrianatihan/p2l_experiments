@@ -34,6 +34,7 @@ def pick_to_learn(
     input_shape,
     train_fn,
     pretrain_fn,
+    num_classes=None,
     pretrain_portion=0.5,
     epochs=60,
     lr=1e-3,
@@ -43,7 +44,6 @@ def pick_to_learn(
     epsilon=0.01,
     pgd_steps=20,
     pgd_restarts=5,
-    bce_threshold=3.0,
     ce_threshold=None,
     pretrain_epochs=100,
     pretrain_kwargs=None,
@@ -51,24 +51,23 @@ def pick_to_learn(
     verifier="autolirpa",
     abcrown_path=None,
     abcrown_timeout=120,
-    chunk_size = 16,
 ):
     """
-    Pick-to-Learn with pluggable verification backend.
-
     Parameters
     ----------
-    ce_threshold   : float — worst-case CE must be ≤ this for ALL remaining
-                     examples to stop. Default log(2) (decision boundary).
-    bce_threshold  : float — PGD phase: empirical worst-case BCE above this
-                     triggers adding to T (autolirpa mode only)
+    num_classes  : int, optional — number of output classes. Used only to
+                   derive the default ce_threshold. If None, falls back to
+                   log(2).
+    ce_threshold : float — worst-case CE must be ≤ this for ALL remaining
+                   examples to stop. Default log(num_classes) if provided,
+                   else log(2). Tune empirically if needed.
     """
     if device == "cuda" and not torch.cuda.is_available():
         print("CUDA not available, falling back to CPU")
         device = "cpu"
 
     if ce_threshold is None:
-        ce_threshold = LOG2
+        ce_threshold = float(np.log(num_classes)) if num_classes else LOG2
 
     pretrain_kwargs = pretrain_kwargs or {}
     retrain_kwargs = retrain_kwargs or {}
@@ -92,10 +91,11 @@ def pick_to_learn(
         print(f"  Samples: {n_samples}  Pretrain: {n_pretrain}  "
               f"P2L pool: {N_effective}")
         print(f"  ε={epsilon:.6f}  Input shape: {input_shape}")
-        print(f"  CE threshold: {ce_threshold:.4f}  (log2={LOG2:.4f})")
+        if num_classes is not None:
+            print(f"  Num classes: {num_classes}")
+        print(f"  CE threshold: {ce_threshold:.4f}")
         if verifier == "autolirpa":
-            print(f"  PGD {pgd_steps}×{pgd_restarts}  "
-                  f"PGD threshold={bce_threshold}")
+            print(f"  PGD {pgd_steps}×{pgd_restarts}")
         else:
             print(f"  abcrown timeout: {abcrown_timeout}s/instance")
 
@@ -125,9 +125,10 @@ def pick_to_learn(
             model_fn=model_fn, input_shape=input_shape,
             train_fn=train_fn, retrain_lr=retrain_lr, epochs=epochs,
             device=device, verbose=verbose, epsilon=epsilon,
+            pgd_steps=pgd_steps, pgd_restarts=pgd_restarts,
             retrain_kwargs=retrain_kwargs,
             abcrown_path=abcrown_path, abcrown_timeout=abcrown_timeout,
-            ce_threshold=ce_threshold, chunk_size=chunk_size,
+            ce_threshold=ce_threshold,
         )
     else:
         _p2l_loop_autolirpa(
@@ -137,7 +138,7 @@ def pick_to_learn(
             train_fn=train_fn, retrain_lr=retrain_lr, epochs=epochs,
             device=device, verbose=verbose, epsilon=epsilon,
             pgd_steps=pgd_steps, pgd_restarts=pgd_restarts,
-            bce_threshold=bce_threshold, retrain_kwargs=retrain_kwargs,
+            retrain_kwargs=retrain_kwargs,
             ce_threshold=ce_threshold,
         )
 
@@ -158,15 +159,12 @@ def _p2l_loop_autolirpa(
     T_indices, stats, iteration, *,
     input_shape, train_fn, retrain_lr, epochs,
     device, verbose, epsilon, pgd_steps, pgd_restarts,
-    bce_threshold, retrain_kwargs, ce_threshold,
+    retrain_kwargs, ce_threshold,
 ):
-    from verification import verify_batch
-
-    threshold = bce_threshold
     prev_deltas = None
 
     while len(available_indices) > 0:
-
+        '''
         # ── Phase A: PGD inner loop ───────────────────────────────────
         pgd_added = 0
         while len(available_indices) > 0:
@@ -179,22 +177,23 @@ def _p2l_loop_autolirpa(
                prev_deltas.shape[0] != len(available_indices):
                 prev_deltas = None
 
-            pgd_bce, _, new_deltas = pgd_attack_bce(
+            pgd_ce, _, new_deltas = pgd_attack_ce(
                 h, X_avail, y_avail, epsilon,
                 pgd_steps=pgd_steps, pgd_restarts=pgd_restarts,
                 device=device, prev_deltas=prev_deltas,
             )
             prev_deltas = new_deltas
 
-            if not (pgd_bce > threshold).any():
+            if not (pgd_ce > ce_threshold).any():
                 if verbose:
                     print(f"  iter {iteration:4d} | PGD converged "
-                          f"(worst={pgd_bce.max().item():.4f} ≤ {threshold}), "
+                          f"(worst={pgd_ce.max().item():.4f} "
+                          f"≤ {ce_threshold:.4f}), "
                           f"added {pgd_added} this round")
                 break
 
-            worst_local = int(pgd_bce.argmax())
-            worst_bce = pgd_bce[worst_local].item()
+            worst_local = int(pgd_ce.argmax())
+            worst_ce = pgd_ce[worst_local].item()
             worst_global = available_indices[worst_local]
             stats["pgd_resolved"] += 1
             pgd_added += 1
@@ -204,7 +203,7 @@ def _p2l_loop_autolirpa(
 
             if verbose:
                 print(f"  iter {iteration:4d} | PGD idx {worst_global:5d} "
-                      f"| BCE={worst_bce:.4f} | |T|={len(T_indices)}")
+                      f"| CE={worst_ce:.4f} | |T|={len(T_indices)}")
 
             h = _retrain(h, X_data, y_data, T_indices, pretrain_indices,
                          train_fn, retrain_lr, epochs, device, retrain_kwargs)
@@ -213,7 +212,7 @@ def _p2l_loop_autolirpa(
             break
 
         # ── Phase B: auto_LiRPA ───────────────────────────────────────
-        iteration += 1
+        iteration += 1 '''
         if verbose:
             print(f"  iter {iteration:4d} | auto_LiRPA on "
                   f"{len(available_indices)} remaining...")
@@ -236,21 +235,21 @@ def _p2l_loop_autolirpa(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  α,β-CROWN flow
+#  α,β-CROWN flow: verify → pick worst → retrain
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _p2l_loop_abcrown(
     h, X_data, y_data, available_indices, pretrain_indices,
     T_indices, stats, iteration, *,
     model_fn, input_shape, train_fn, retrain_lr, epochs,
-    device, verbose, epsilon, retrain_kwargs,
-    abcrown_path, abcrown_timeout, ce_threshold, chunk_size,
+    device, verbose, epsilon,
+    pgd_steps, pgd_restarts,
+    retrain_kwargs,
+    abcrown_path, abcrown_timeout, ce_threshold,
 ):
-    from verification_abcrown import verify_batch_abcrown
-
     while len(available_indices) > 0:
-        iteration += 1
 
+        iteration += 1
         if verbose:
             print(f"  iter {iteration:4d} | α,β-CROWN on "
                   f"{len(available_indices)} remaining...")
@@ -287,7 +286,7 @@ def _process_results(
     """
     After verification, split into verified (safe) and unverified.
     CE is only meaningful for verified examples (clean forward-pass CE).
- 
+
     If worst CE among verified ≤ ce_threshold:
         → bulk-add all unverified to T, stop.
     Otherwise:
@@ -295,15 +294,15 @@ def _process_results(
     """
     verified = []    # (gidx, wc_ce)
     unverified = []  # (gidx, status, wc_ce)
- 
+
     for gidx, (status, wc_ce) in statuses.items():
         if status == "verified":
             verified.append((gidx, wc_ce))
         else:
             unverified.append((gidx, status, wc_ce))
- 
+
     worst_verified_ce = max((ce for _, ce in verified), default=0.0)
- 
+
     if verbose:
         n_unsafe = sum(1 for _, s, _ in unverified if s == "unsafe")
         n_unknown = len(unverified) - n_unsafe
@@ -313,7 +312,7 @@ def _process_results(
               f"worst CE: {worst_verified_ce:.4f}")
         print(f"    Unverified: {len(unverified)} "
               f"(unsafe={n_unsafe}, unknown/timeout={n_unknown})")
- 
+
     # ── Stop if all verified examples have CE ≤ threshold ─────────────
     if worst_verified_ce <= ce_threshold:
         if unverified:
@@ -321,7 +320,7 @@ def _process_results(
                 T_indices.append(gidx)
                 available_indices.remove(gidx)
             stats["inappropriate"] = stats.get("inappropriate", 0) + len(unverified)
- 
+
             if verbose:
                 print(f"\n  ✓ Worst verified CE ({worst_verified_ce:.4f}) "
                       f"≤ {ce_threshold:.4f}. Stopping.")
@@ -332,30 +331,29 @@ def _process_results(
                 print(f"\n  ✓ All {len(available_indices)} verified, "
                       f"worst CE {worst_verified_ce:.4f} "
                       f"≤ {ce_threshold:.4f}. Nothing added.")
- 
+
         stats["appropriate"] = stats.get("appropriate", 0) + len(verified)
         return None, h, iteration
- 
+
     # ── Not done: pick worst overall, add to T, retrain ───────────────
     all_candidates = [(g, "verified", ce) for g, ce in verified]
     all_candidates += [(g, s, ce) for g, s, ce in unverified]
     all_candidates.sort(key=lambda t: t[2], reverse=True)
- 
+
     pick_global, pick_status, pick_ce = all_candidates[0]
     T_indices.append(pick_global)
     available_indices.remove(pick_global)
     stats["inappropriate"] = stats.get("inappropriate", 0) + 1
- 
+
     if verbose:
         print(f"  iter {iteration:4d} | {verifier_name} added "
               f"idx {pick_global:5d} ({pick_status}, "
               f"ce={pick_ce:.4f}) | |T|={len(T_indices)}")
- 
+
     h = _retrain(h, X_data, y_data, T_indices, pretrain_indices,
                  train_fn, retrain_lr, epochs, device, retrain_kwargs)
- 
-    return all_candidates, h, iteration
 
+    return all_candidates, h, iteration
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

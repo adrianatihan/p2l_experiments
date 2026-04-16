@@ -33,11 +33,8 @@ import torch.nn.functional as F
 
 def verify_batch_abcrown(model, indices, X_data, y_data, epsilon,
                          input_shape, device="cuda", abcrown_path=None,
-                         timeout=120, verbose=True, chunk_size=16):
-    """
-    Verify examples using α,β-CROWN (complete: PGD + alpha-CROWN + BaB).
-    Processes in chunks. Returns dict[int → (status, worst_case_ce)].
-    """
+                         timeout=120, verbose=True, chunk_size=None):
+    """Verify examples using α,β-CROWN for multi-class classification."""
     if not abcrown_path:
         raise ValueError(
             "abcrown_path must point to alpha-beta-CROWN/complete_verifier/"
@@ -46,57 +43,53 @@ def verify_batch_abcrown(model, indices, X_data, y_data, epsilon,
     if len(indices) == 0:
         return {}
 
-    chunks = [indices[i:i + chunk_size]
-              for i in range(0, len(indices), chunk_size)]
+    # Infer num_classes via a forward pass
+    model.eval()
+    with torch.no_grad():
+        dummy = torch.zeros(1, *input_shape[1:]).to(device)
+        num_classes = int(model(dummy).shape[-1])
 
     if verbose:
-        print(f"    Verifying {len(indices)} examples in "
-              f"{len(chunks)} chunks (≤{chunk_size}) via α,β-CROWN")
+        print(f"    Verifying {len(indices)} examples via α,β-CROWN "
+              f"(multi-class, C={num_classes})")
 
+    work_dir = tempfile.mkdtemp(prefix="abcrown_p2l_")
     all_statuses = {}
 
-    for ci, chunk_indices in enumerate(chunks):
-        work_dir = tempfile.mkdtemp(prefix="abcrown_p2l_")
+    try:
+        # ── 1. Export ONNX once ───────────────────────────────────────
+        onnx_path = _export_onnx(model, input_shape, work_dir, device)
 
-        try:
-            onnx_path = _export_onnx(model, input_shape, work_dir, device)
+        # ── 2. Bulk-write all VNN-LIB specs ───────────────────────────
+        spec_dir = os.path.join(work_dir, "specs")
+        os.makedirs(spec_dir, exist_ok=True)
 
-            spec_dir = os.path.join(work_dir, "specs")
-            os.makedirs(spec_dir, exist_ok=True)
+        ordered = list(indices)
+        spec_paths = _write_vnnlib_bulk(
+            ordered, X_data, y_data, epsilon, spec_dir, num_classes)
 
-            idx_to_spec = {}
-            for gidx in chunk_indices:
-                idx_to_spec[gidx] = _write_vnnlib(
-                    gidx, X_data, y_data, epsilon, input_shape, spec_dir)
+        # ── 3. Single instances CSV ───────────────────────────────────
+        csv_path = os.path.join(work_dir, "instances.csv")
+        csv_lines = [f"{onnx_path},{spec_paths[gidx]},{timeout}"
+                     for gidx in ordered]
+        with open(csv_path, "w") as f:
+            f.write("\n".join(csv_lines) + "\n")
 
-            csv_path = os.path.join(work_dir, "instances.csv")
-            ordered = list(chunk_indices)
-            with open(csv_path, "w") as f:
-                for gidx in ordered:
-                    f.write(f"{onnx_path},{idx_to_spec[gidx]},{timeout}\n")
+        # ── 4. YAML config + run ──────────────────────────────────────
+        yaml_path = _write_yaml_config(work_dir, device, timeout)
+        results_path = os.path.join(work_dir, "results.txt")
+        _run_abcrown(abcrown_path, yaml_path, csv_path,
+                     results_path, verbose=verbose)
 
-            yaml_path = _write_yaml_config(work_dir, device, timeout)
+        # ── 5. Parse ──────────────────────────────────────────────────
+        all_statuses = _parse_results(results_path, ordered,
+                                      verbose=verbose)
 
-            results_path = os.path.join(work_dir, "results.txt")
-            _run_abcrown(abcrown_path, yaml_path, csv_path,
-                         results_path, verbose=(verbose and ci == 0))
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        torch.cuda.empty_cache()
 
-            chunk_statuses = _parse_results(results_path, ordered,
-                                            verbose=(verbose and ci == 0))
-            all_statuses.update(chunk_statuses)
-
-        finally:
-            shutil.rmtree(work_dir, ignore_errors=True)
-            torch.cuda.empty_cache()
-
-        if verbose:
-            nv = sum(1 for s in all_statuses.values() if s == "verified")
-            nu = sum(1 for s in all_statuses.values() if s == "unsafe")
-            nk = sum(1 for s in all_statuses.values() if s == "unknown")
-            print(f"        Chunk {ci+1}/{len(chunks)}: "
-                  f"{nv} verified, {nu} unsafe, {nk} unknown so far")
-
-    # ── Compute ranking CE bounds ─────────────────────────────────────
+    # ── 6. Compute ranking CE ─────────────────────────────────────────
     results = _add_ranking_bounds(all_statuses, model, X_data, y_data,
                                   epsilon, input_shape, device)
 
@@ -128,40 +121,75 @@ def _export_onnx(model, input_shape, work_dir, device):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  VNN-LIB spec generation
+#  VNN-LIB spec generation (multi-class)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _write_vnnlib(gidx, X_data, y_data, epsilon, input_shape, spec_dir):
+def _write_vnnlib_bulk(indices, X_data, y_data, epsilon, spec_dir, num_classes):
+    """
+    Write VNN-LIB specs for multi-class robustness.
+
+    For each example (x, y_true), the property asserts the UNSAFE condition:
+        ∃ c ≠ y_true.  Y_c ≥ Y_{y_true}
+
+    encoded as:
+        (assert (or
+          (and (>= Y_c0 Y_{y_true}))
+          (and (>= Y_c1 Y_{y_true}))
+          ...
+        ))
+
+    α,β-CROWN returns UNSAT (safe/verified) if the model is robust,
+    SAT (unsafe) if there's a counterexample.
+    """
+    spec_paths = {}
+
     if isinstance(X_data, torch.Tensor):
-        x = X_data[gidx].cpu().numpy().flatten().astype(np.float64)
-        y = int(y_data[gidx].item())
+        X_np = X_data[indices].cpu().numpy().reshape(len(indices), -1)
+        y_np = y_data[indices].cpu().numpy()
     else:
-        x = np.asarray(X_data[gidx], dtype=np.float64).flatten()
-        y = int(y_data[gidx])
+        X_np = np.asarray(X_data[indices], dtype=np.float64).reshape(
+            len(indices), -1)
+        y_np = np.asarray([int(y_data[g]) for g in indices])
 
-    n_inputs = len(x)
-    spec_path = os.path.join(spec_dir, f"prop_{gidx}.vnnlib")
+    n_inputs = X_np.shape[1]
 
-    with open(spec_path, "w") as f:
+    # Pre-build shared declarations (same for all instances)
+    declares = "".join(f"(declare-const X_{i} Real)\n" for i in range(n_inputs))
+    declares += "".join(f"(declare-const Y_{c} Real)\n" for c in range(num_classes))
+    declares += "\n"
+
+    for j, gidx in enumerate(indices):
+        x = X_np[j]
+        y = int(y_np[j])
+
+        # Input bounds
+        lbs = x - epsilon
+        ubs = x + epsilon
+        bounds_lines = []
         for i in range(n_inputs):
-            f.write(f"(declare-const X_{i} Real)\n")
-        f.write("(declare-const Y_0 Real)\n\n")
+            bounds_lines.append(f"(assert (>= X_{i} {lbs[i]:.12f}))")
+            bounds_lines.append(f"(assert (<= X_{i} {ubs[i]:.12f}))")
+        bounds = "\n".join(bounds_lines)
 
-        for i in range(n_inputs):
-            lb = x[i] - epsilon
-            ub = x[i] + epsilon
-            f.write(f"(assert (>= X_{i} {lb:.12f}))\n")
-            f.write(f"(assert (<= X_{i} {ub:.12f}))\n")
-        f.write("\n")
+        # Multi-class unsafe disjunction
+        other_classes = [c for c in range(num_classes) if c != y]
+        or_clauses = "\n".join(
+            f"  (and (>= Y_{c} Y_{y}))" for c in other_classes
+        )
+        prop = (
+            f"\n; y={y}: unsafe if any other class dominates the true class\n"
+            f"(assert (or\n{or_clauses}\n))\n"
+        )
 
-        if y == 1:
-            f.write("; y=1: unsafe if logit <= 0\n")
-            f.write("(assert (<= Y_0 0.0))\n")
-        else:
-            f.write("; y=0: unsafe if logit >= 0\n")
-            f.write("(assert (>= Y_0 0.0))\n")
+        spec_path = os.path.join(spec_dir, f"prop_{gidx}.vnnlib")
+        with open(spec_path, "w") as f:
+            f.write(declares)
+            f.write(bounds)
+            f.write(prop)
 
-    return spec_path
+        spec_paths[gidx] = spec_path
+
+    return spec_paths
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -326,33 +354,26 @@ def _normalise_status(raw):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Ranking bounds via auto_LiRPA backward
+#  Ranking bounds (multi-class)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _add_ranking_bounds(abcrown_statuses, model, X_data, y_data,
                         epsilon, input_shape, device, ranking_chunk=64):
     """
-    Compute CE for ranking after abcrown verification.
-
-    - Unsafe/unknown examples: wc_ce = inf (they'll always be picked first)
-    - Verified (safe) examples: CE from model's clean forward pass
-      (needed to check ce_threshold stopping condition)
-
-    No auto_LiRPA needed — just a standard forward pass + cross entropy.
+    - Unsafe/unknown: wc_ce = inf (always picked first)
+    - Verified: clean forward-pass CE (for ce_threshold check)
     """
     results = {}
 
     unsat_indices = [g for g, s in abcrown_statuses.items() if s != "verified"]
     sat_indices = [g for g, s in abcrown_statuses.items() if s == "verified"]
 
-    # Unsat examples get inf — they'll always be selected over sat
     for gidx in unsat_indices:
         results[gidx] = (abcrown_statuses[gidx], float("inf"))
 
     if not sat_indices:
         return results
 
-    # Compute clean CE for verified examples (standard forward pass)
     model.eval()
     with torch.no_grad():
         for i in range(0, len(sat_indices), ranking_chunk):
@@ -360,101 +381,19 @@ def _add_ranking_bounds(abcrown_statuses, model, X_data, y_data,
 
             if isinstance(X_data, torch.Tensor):
                 x = X_data[chunk].float().to(device)
-                y = y_data[chunk].to(device)
+                y = y_data[chunk].long().to(device)
             else:
                 x = torch.FloatTensor(X_data[chunk]).to(device)
-                y = torch.LongTensor([int(y_data[g]) for g in chunk]).to(device)
+                y = torch.LongTensor(
+                    [int(y_data[g]) for g in chunk]).to(device)
 
             if x.dim() == 2 and len(input_shape) == 4:
                 x = x.view(-1, *input_shape[1:])
 
             logits = model(x)
-
-            if logits.shape[-1] == 1:
-                # Binary single-logit
-                ce = torch.nn.functional.binary_cross_entropy_with_logits(
-                    logits.squeeze(-1), y.float(), reduction="none")
-            else:
-                # Multi-class
-                ce = torch.nn.functional.cross_entropy(
-                    logits, y, reduction="none")
+            ce = F.cross_entropy(logits, y, reduction="none")
 
             for j, gidx in enumerate(chunk):
                 results[gidx] = ("verified", ce[j].item())
-
-    return results
-
-def _add_ranking_bounds_autolirpa(abcrown_statuses, model, X_data, y_data,
-                        epsilon, input_shape, device, ranking_chunk=4):
-    """
-    Compute worst-case CE from auto_LiRPA bounds for ranking.
-
-    Smart strategy:
-      - If any UNSAT (unsafe/unknown) examples exist → compute CE only
-        for those. An unsat example will always be picked over a sat one,
-        so sat CE doesn't matter for selection.
-      - If ALL are SAT (verified) → compute CE for ALL remaining.
-        The P2L loop needs wc_ce for every example to check whether
-        ce_threshold is satisfied (the stopping condition).
-
-    abcrown's status (verified/unsafe/unknown) is preserved.
-    Only the wc_ce ranking comes from auto_LiRPA bounds.
-    """
-    from verification import _ensure_autolirpa, _verify_chunk
-
-    results = {}
-    all_indices = list(abcrown_statuses.keys())
-
-    unsat_indices = [g for g, s in abcrown_statuses.items()
-                     if s != "verified"]
-    sat_indices = [g for g, s in abcrown_statuses.items()
-                   if s == "verified"]
-
-    if unsat_indices:
-        # Unsat exist → only compute bounds for unsat (they'll be picked)
-        # Sat examples get wc_ce = 0 (won't be selected)
-        for gidx in sat_indices:
-            results[gidx] = ("verified", 0.0)
-        indices_to_bound = unsat_indices
-    else:
-        # All verified → compute bounds for ALL (check ce_threshold)
-        indices_to_bound = all_indices
-
-    if not indices_to_bound:
-        return results
-
-    try:
-        _ensure_autolirpa()
-        chunks = [indices_to_bound[i:i + ranking_chunk]
-                  for i in range(0, len(indices_to_bound), ranking_chunk)]
-
-        for chunk in chunks:
-            torch.cuda.empty_cache()
-            chunk_results = _verify_chunk(
-                model, chunk, X_data, y_data,
-                epsilon, input_shape, device,
-            )
-            if chunk_results is not None:
-                for gidx in chunk:
-                    _, wc_ce = chunk_results.get(gidx, (None, float("inf")))
-                    results[gidx] = (abcrown_statuses[gidx], wc_ce)
-            else:
-                # OOM — single-sample fallback
-                for gidx in chunk:
-                    torch.cuda.empty_cache()
-                    single = _verify_chunk(
-                        model, [gidx], X_data, y_data,
-                        epsilon, input_shape, device,
-                    )
-                    if single is not None:
-                        _, wc_ce = single.get(gidx, (None, float("inf")))
-                        results[gidx] = (abcrown_statuses[gidx], wc_ce)
-                    else:
-                        results[gidx] = (abcrown_statuses[gidx], float("inf"))
-
-    except Exception:
-        for gidx in indices_to_bound:
-            if gidx not in results:
-                results[gidx] = (abcrown_statuses[gidx], float("inf"))
 
     return results
